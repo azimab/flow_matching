@@ -1,0 +1,19 @@
+model: action_mlp
+
+# training
+epochs: 100
+batch_size: 256
+lr: 0.0003
+sigma: 0.0
+save_dir: checkpoints_action
+log_every: 100
+
+# action MLP architecture
+hidden_dims: [512, 512, 512]
+time_embed_dim: 64
+activation: silu
+
+# rollout / sampling
+n_ode_steps: 50
+max_rollout_steps: 128
+goal_threshold: 0.05

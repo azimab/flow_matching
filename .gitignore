@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.pt
+venv/
+checkpoints_action/
+data_trajectories/
