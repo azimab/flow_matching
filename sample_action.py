@@ -7,6 +7,7 @@ import yaml
 
 from data import ActionStepDataset
 from models import ActionVectorField
+from obstacles import ObstacleScene, collision_cost, project_to_feasible, check_collisions
 
 
 DEFAULTS = dict(
@@ -21,6 +22,10 @@ DEFAULTS = dict(
     env_robot="EnvEmptyNoWait2D-RobotCompositeTwoPlanarDisk",
     device="cuda" if torch.cuda.is_available() else "cpu",
     out=None,
+    guidance_scale=0.1,
+    obstacle_margin=0.05,
+    robot_radii=None,
+    obstacles_file=None,
 )
 
 
@@ -33,6 +38,8 @@ def load_config() -> SimpleNamespace:
             parser.add_argument(flag, action="store_true", default=None)
         elif default is None:
             parser.add_argument(flag, type=str, default=None)
+        elif isinstance(default, list):
+            parser.add_argument(flag, nargs="+", type=type(default[0]), default=None)
         else:
             parser.add_argument(flag, type=type(default), default=None)
     args = parser.parse_args()
@@ -52,17 +59,31 @@ def sample_action(
     model: ActionVectorField,
     condition: torch.Tensor,
     n_ode_steps: int = 50,
+    state: torch.Tensor | None = None,
+    scene: ObstacleScene | None = None,
+    guidance_scale: float = 0.1,
+    obstacle_margin: float = 0.05,
 ) -> torch.Tensor:
     device = condition.device
     B = condition.shape[0]
     a = torch.randn(B, model.action_dim, device=device)
     dt = 1.0 / n_ode_steps
 
-    with torch.no_grad():
-        for i in range(n_ode_steps):
-            t = torch.full((B,), i * dt, device=device)
+    use_guidance = scene is not None and state is not None and len(scene.obstacles) > 0
+
+    for i in range(n_ode_steps):
+        t = torch.full((B,), i * dt, device=device)
+        with torch.no_grad():
             v = model(a, t, condition)
+
+        if use_guidance:
+            a_g = a.detach().requires_grad_(True)
+            cost = collision_cost(a_g, state, scene, margin=obstacle_margin)
+            grad = torch.autograd.grad(cost, a_g)[0]
+            a = a + v * dt - guidance_scale * grad * dt
+        else:
             a = a + v * dt
+
     return a
 
 
@@ -107,6 +128,9 @@ def rollout(
     max_steps: int = 128,
     goal_threshold: float = 0.05,
     snap_radius: float = 0.01,
+    scene: ObstacleScene | None = None,
+    guidance_scale: float = 0.1,
+    obstacle_margin: float = 0.05,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     device = start.device
     B = start.shape[0]
@@ -125,7 +149,18 @@ def rollout(
         goal_features = ActionStepDataset.compute_goal_features(state, goal, n_disks)
         c = torch.cat([state, goal, goal_features], dim=-1)
 
-        action = sample_action(model, c, n_ode_steps=n_ode_steps)
+        action = sample_action(
+            model, c,
+            n_ode_steps=n_ode_steps,
+            state=state,
+            scene=scene,
+            guidance_scale=guidance_scale,
+            obstacle_margin=obstacle_margin,
+        )
+
+        if scene is not None and len(scene.obstacles) > 0:
+            action = project_to_feasible(action, state, scene)
+
         action = clamp_to_goal(action, state, goal, n_disks, snap_radius=snap_radius)
 
         action[reached] = 0.0
@@ -152,6 +187,7 @@ def compute_metrics(
     goal: torch.Tensor,
     reached: torch.Tensor,
     n_disks: int,
+    scene: ObstacleScene | None = None,
 ) -> dict:
     B, T, D = trajectory.shape
     pos_dim = D // 2
@@ -173,11 +209,21 @@ def compute_metrics(
         smoothness_vals = accel.pow(2).mean(dim=(1, 2))
     smoothness = smoothness_vals.mean().item()
 
-    return {
+    metrics = {
         "goal_reaching_rate": goal_rate,
         "path_efficiency": efficiency,
         "smoothness_msa": smoothness,
     }
+
+    if scene is not None and len(scene.obstacles) > 0:
+        positions = trajectory[:, :, :pos_dim]
+        colliding = check_collisions(positions, scene)
+        metrics["collision_rate"] = colliding.float().mean().item()
+        metrics["collision_free_traj_rate"] = (
+            (~colliding.any(dim=1)).float().mean().item()
+        )
+
+    return metrics
 
 
 def main():
@@ -203,6 +249,22 @@ def main():
 
     n_disks = ckpt["n_disks"]
 
+    # Build obstacle scene
+    scene = None
+    obstacles_cfg: list[dict] = []
+    if cfg.obstacles_file:
+        with open(cfg.obstacles_file) as f:
+            obstacles_cfg = yaml.safe_load(f) or []
+    elif hasattr(cfg, "obstacles") and cfg.obstacles:
+        obstacles_cfg = cfg.obstacles
+
+    if obstacles_cfg:
+        radii = cfg.robot_radii if cfg.robot_radii else [0.08] * n_disks
+        scene = ObstacleScene.from_config(obstacles_cfg, radii).to(device)
+        print(f"Loaded {len(scene.obstacles)} obstacles, robot_radii={scene.robot_radii}")
+    else:
+        print("No obstacles configured.")
+
     if cfg.condition_from_data:
         data_root = Path(cfg.data_root) if cfg.data_root else (root / "data_trajectories")
         ds = ActionStepDataset(data_root, env_robot=cfg.env_robot)
@@ -227,13 +289,16 @@ def main():
         max_steps=cfg.max_rollout_steps,
         goal_threshold=cfg.goal_threshold,
         snap_radius=cfg.snap_radius,
+        scene=scene,
+        guidance_scale=cfg.guidance_scale,
+        obstacle_margin=cfg.obstacle_margin,
     )
 
     print(f"Trajectory shape: {trajectory.shape}")
     print(f"Reached goal: {reached.sum().item()}/{cfg.num_samples}")
 
-    metrics = compute_metrics(trajectory, goal, reached, n_disks)
-    print(f"Metrics:")
+    metrics = compute_metrics(trajectory, goal, reached, n_disks, scene=scene)
+    print("Metrics:")
     for k, v in metrics.items():
         print(f"  {k}: {v:.4f}")
 

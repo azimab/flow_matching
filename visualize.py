@@ -2,13 +2,18 @@ import argparse
 from pathlib import Path
 
 import torch
+import yaml
 
 try:
     import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
     import numpy as np
 except ImportError:
     plt = None
     np = None
+    mpatches = None
+
+from obstacles import ObstacleScene
 
 
 def get_position_paths(traj):
@@ -68,6 +73,21 @@ def plot_goal_markers(goal, ax, n_disks):
                    label=f"goal disk {k}" if k == 0 else None)
 
 
+def plot_obstacles(scene: ObstacleScene, ax, obstacle_color="#444444",
+                   obstacle_alpha=0.5, robot_radii_alpha=0.12):
+    """Draw circle obstacles as filled patches.
+
+    Also draws robot-inflated boundaries (Minkowski sum) as dashed outlines
+    so it's clear how close the disk centers can get.
+    """
+    for i, obs in enumerate(scene.obstacles):
+        cx, cy = obs.center[0].item(), obs.center[1].item()
+        circle = plt.Circle((cx, cy), obs.radius, color=obstacle_color,
+                             alpha=obstacle_alpha, zorder=2,
+                             label="obstacle" if i == 0 else None)
+        ax.add_patch(circle)
+
+        
 def main():
     parser = argparse.ArgumentParser(description="Visualize sampled trajectories")
     parser.add_argument("trajectories", type=str, help="Path to .pt file with shape (num_samples, T, D)")
@@ -76,6 +96,8 @@ def main():
     parser.add_argument("--ref_trajectory", type=str, default=None, help="Overlay one reference (original) trajectory from dataset; pass data root path (e.g. data_trajectories)")
     parser.add_argument("--env_robot", type=str, default="EnvEmptyNoWait2D-RobotCompositeTwoPlanarDisk", help="env_robot subdirectory for reference trajectories")
     parser.add_argument("--goal", type=str, default=None, help="Path to .pt goal tensor (state_dim,) to show goal markers")
+    parser.add_argument("--obstacles_file", type=str, default=None, help="YAML file with obstacle list [{center: [x,y], radius: r}, ...]")
+    parser.add_argument("--robot_radii", nargs="+", type=float, default=None, help="Robot disk radii (for inflated boundaries)")
     parser.add_argument("--show", action="store_true", help="Show interactive figure")
     args = parser.parse_args()
 
@@ -125,6 +147,20 @@ def main():
     else:
         ax.set_title("Sampled trajectories (dots=start, squares=goal)")
 
+    # Draw obstacles if provided
+    scene = None
+    if args.obstacles_file:
+        obs_path = Path(args.obstacles_file)
+        if not obs_path.is_absolute():
+            obs_path = root / obs_path
+        with open(obs_path) as f:
+            obs_cfg = yaml.safe_load(f) or []
+        D = trajs.shape[-1]
+        n_disks = (D // 2) // 2
+        radii = args.robot_radii if args.robot_radii else [0.08] * n_disks
+        scene = ObstacleScene.from_config(obs_cfg, radii)
+        plot_obstacles(scene, ax)
+
     plot_trajectories(trajs, ax=ax, alpha=0.8, label_prefix="sampled")
 
     if args.goal:
@@ -133,7 +169,7 @@ def main():
         n_disks = (D // 2) // 2
         plot_goal_markers(goal, ax, n_disks)
 
-    if args.ref_trajectory or args.goal:
+    if args.ref_trajectory or args.goal or scene is not None:
         ax.legend(fontsize=8)
 
     fig.tight_layout()
