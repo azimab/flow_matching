@@ -23,23 +23,14 @@ def _find_sample_dirs(root: Path):
 
 
 class ActionStepDataset(Dataset):
-    """
-    Returns (state, goal, action, goal_features) per timestep.
-    """
     def __init__(
         self,
         data_root: str | Path,
         env_robot: str = DEFAULT_ENV_ROBOT,
     ):
         self.root = Path(data_root)
-
         all_candidates = list(_find_sample_dirs(self.root))
-        if not all_candidates:
-            raise FileNotFoundError(f"No trajs-free.pt found under {self.root}")
-
         traj_samples = [(e, s) for e, s in all_candidates if e == env_robot]
-        
-
         self._index: list[tuple[str, str, int]] = []
         self._traj_cache: dict[tuple[str, str], torch.Tensor] = {}
 
@@ -54,8 +45,8 @@ class ActionStepDataset(Dataset):
         D = first_traj.shape[1]
         self.state_dim = D
         self.pos_dim = D // 2
-        self.action_dim = self.pos_dim
         self.n_disks = self.pos_dim // 2
+        self.action_dim = 2
 
     def _load_trajectory(self, env_robot: str, sample_id: str) -> torch.Tensor:
         path = self.root / env_robot / sample_id / "trajs-free.pt"
@@ -84,16 +75,22 @@ class ActionStepDataset(Dataset):
 
     @property
     def condition_dim(self) -> int:
-        return self.state_dim + self.state_dim + self.pos_dim + self.n_disks
+        goal_feat_dim = self.pos_dim + self.n_disks
+        return self.state_dim + self.state_dim + goal_feat_dim + self.n_disks
 
     def __len__(self) -> int:
-        return len(self._index)
+        return len(self._index) * self.n_disks
 
     def __getitem__(self, idx: int):
-        env_robot, sample_id, t = self._index[idx]
+        disk_k = idx % self.n_disks
+        base_idx = idx // self.n_disks
+        env_robot, sample_id, t = self._index[base_idx]
         traj = self._traj_cache[(env_robot, sample_id)]
         state = traj[t]
         goal = traj[-1]
-        action = traj[t + 1, :self.pos_dim] - traj[t, :self.pos_dim]
+        full_action = traj[t + 1, : self.pos_dim] - traj[t, : self.pos_dim]
+        action_k = full_action[2 * disk_k : 2 * disk_k + 2]
         goal_features = self.compute_goal_features(state, goal, self.n_disks)
-        return state, goal, action, goal_features
+        disk_one_hot = torch.zeros(self.n_disks, dtype=torch.float32)
+        disk_one_hot[disk_k] = 1.0
+        return state, goal, action_k, goal_features, disk_one_hot

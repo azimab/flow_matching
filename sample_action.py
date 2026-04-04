@@ -5,118 +5,132 @@ from types import SimpleNamespace
 import torch
 import yaml
 
-from data import ActionStepDataset
+from data import ActionStepDataset, DEFAULT_ENV_ROBOT
 from models import ActionVectorField
-from obstacles import ObstacleScene, collision_cost, project_to_feasible, check_collisions
-
-
-DEFAULTS = dict(
-    checkpoint="checkpoints_action/action_checkpoint.pt",
-    num_samples=8,
-    n_ode_steps=50,
-    max_rollout_steps=128,
-    goal_threshold=0.05,
-    snap_radius=0.01,
-    condition_from_data=False,
-    data_root=None,
-    env_robot="EnvEmptyNoWait2D-RobotCompositeTwoPlanarDisk",
-    device="cuda" if torch.cuda.is_available() else "cpu",
-    out=None,
-    guidance_scale=0.1,
-    obstacle_margin=0.05,
-    robot_radii=None,
-    obstacles_file=None,
+from obstacles import (
+    ObstacleScene,
+    adjust_disk_action_slice,
+    check_collisions,
+    project_to_feasible,
 )
+
+# Obstacle sampling: bridge mixing count; noise resample period (0 = effectively never).
+_ECI_N_MIX = 3
+_ECI_RESAMPLE_STEP = 0
+
+# Defaults only when a key is missing from YAML (see load_config).
+_FALLBACK = {
+    "checkpoint": "checkpoints_action/action_checkpoint.pt",
+    "num_samples": 8,
+    "n_ode_steps": 50,
+    "max_rollout_steps": 128,
+    "goal_threshold": 0.05,
+    "condition_from_data": False,
+    "data_root": None,
+    "env_robot": DEFAULT_ENV_ROBOT,
+    "out": None,
+    "robot_radii": None,
+    "obstacles_file": None,
+    "obstacles": [],
+}
 
 
 def load_config() -> SimpleNamespace:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("config", nargs="?", default=None)
-    for key, default in DEFAULTS.items():
-        flag = f"--{key}"
-        if isinstance(default, bool):
-            parser.add_argument(flag, action="store_true", default=None)
-        elif default is None:
-            parser.add_argument(flag, type=str, default=None)
-        elif isinstance(default, list):
-            parser.add_argument(flag, nargs="+", type=type(default[0]), default=None)
-        else:
-            parser.add_argument(flag, type=type(default), default=None)
-    args = parser.parse_args()
+    root = Path(__file__).resolve().parent
+    p = argparse.ArgumentParser(description="Roll out flow-matching policy (settings from YAML).")
+    p.add_argument(
+        "config",
+        nargs="?",
+        default=str(root / "configs" / "action_mlp.yaml"),
+        help="YAML with rollout / obstacle keys",
+    )
+    p.add_argument("--checkpoint", default=None, help="Override checkpoint path")
+    p.add_argument("--out", default=None, help="Override output .pt path")
+    p.add_argument("--num-samples", type=int, default=None)
+    p.add_argument("--device", default=None)
+    args = p.parse_args()
 
-    cfg = dict(DEFAULTS)
-    if args.config:
-        with open(args.config) as f:
-            cfg.update(yaml.safe_load(f))
-    for key in DEFAULTS:
-        val = getattr(args, key, None)
-        if val is not None:
-            cfg[key] = val
+    cfg_path = Path(args.config)
+    if not cfg_path.is_file():
+        raise FileNotFoundError(f"Config not found: {cfg_path}")
+    with open(cfg_path) as f:
+        from_yaml = yaml.safe_load(f) or {}
+
+    cfg = {**_FALLBACK, **from_yaml}
+    if args.checkpoint is not None:
+        cfg["checkpoint"] = args.checkpoint
+    if args.out is not None:
+        cfg["out"] = args.out
+    if args.num_samples is not None:
+        cfg["num_samples"] = args.num_samples
+    if args.device is not None:
+        cfg["device"] = args.device
+    elif "device" not in cfg or cfg["device"] is None:
+        cfg["device"] = "cuda" if torch.cuda.is_available() else "cpu"
+
     return SimpleNamespace(**cfg)
 
 
 def sample_action(
     model: ActionVectorField,
-    condition: torch.Tensor,
-    n_ode_steps: int = 50,
-    state: torch.Tensor | None = None,
-    scene: ObstacleScene | None = None,
-    guidance_scale: float = 0.1,
-    obstacle_margin: float = 0.05,
-) -> torch.Tensor:
-    device = condition.device
-    B = condition.shape[0]
-    a = torch.randn(B, model.action_dim, device=device)
-    dt = 1.0 / n_ode_steps
-
-    use_guidance = scene is not None and state is not None and len(scene.obstacles) > 0
-
-    for i in range(n_ode_steps):
-        t = torch.full((B,), i * dt, device=device)
-        with torch.no_grad():
-            v = model(a, t, condition)
-
-        if use_guidance:
-            a_g = a.detach().requires_grad_(True)
-            cost = collision_cost(a_g, state, scene, margin=obstacle_margin)
-            grad = torch.autograd.grad(cost, a_g)[0]
-            a = a + v * dt - guidance_scale * grad * dt
-        else:
-            a = a + v * dt
-
-    return a
-
-
-def clamp_to_goal(
-    action: torch.Tensor,
     state: torch.Tensor,
     goal: torch.Tensor,
     n_disks: int,
-    snap_radius: float = 0.01,
+    n_ode_steps: int,
+    scene: ObstacleScene | None = None,
 ) -> torch.Tensor:
+    device = state.device
+    B = state.shape[0]
     pos_dim = n_disks * 2
-    current_pos = state[:, :pos_dim]
-    goal_pos = goal[:, :pos_dim]
-    disp = goal_pos - current_pos
+    dt = 1.0 / n_ode_steps
+    goal_features = ActionStepDataset.compute_goal_features(state, goal, n_disks)
+    base_c = torch.cat([state, goal, goal_features], dim=-1)
 
-    out = action.clone()
+    use_eci = scene is not None and len(scene.obstacles) > 0
+    rs = _ECI_RESAMPLE_STEP
+    if use_eci and rs == 0:
+        rs = n_ode_steps * _ECI_N_MIX + 1
+
+    action_full = torch.zeros(B, pos_dim, device=device)
     for k in range(n_disks):
-        s = 2 * k
-        e = s + 2
-        d_k = disp[:, s:e]
-        a_k = action[:, s:e]
-        d_norm = d_k.norm(dim=-1)
-        a_norm = a_k.norm(dim=-1).clamp(min=1e-8)
+        disk_oh = torch.zeros(B, n_disks, device=device)
+        disk_oh[:, k] = 1.0
+        condition = torch.cat([base_c, disk_oh], dim=-1)
 
-        close = d_norm < snap_radius
-        out[close, s:e] = d_k[close]
+        noise = torch.randn(B, model.action_dim, device=device)
+        a = noise.clone()
+        cnt = 0
 
-        overshoot = (~close) & (a_norm > d_norm)
-        if overshoot.any():
-            scale = (d_norm[overshoot] / a_norm[overshoot]).unsqueeze(-1)
-            out[overshoot, s:e] = a_k[overshoot] * scale
+        for i in range(n_ode_steps):
+            t_scalar = i * dt
+            t = torch.full((B,), t_scalar, device=device)
 
-    return out
+            if use_eci:
+                for u in range(_ECI_N_MIX):
+                    cnt += 1
+                    if cnt % rs == 0:
+                        noise = torch.randn(B, model.action_dim, device=device)
+                    with torch.no_grad():
+                        v = model(a, t, condition)
+                    br = (1.0 - t).unsqueeze(-1)
+                    a1 = a + v * br
+                    a1 = adjust_disk_action_slice(
+                        a1, action_full, k, n_disks, state, scene
+                    )
+                    if u < _ECI_N_MIX - 1:
+                        a = a1 * t.unsqueeze(-1) + noise * (1.0 - t.unsqueeze(-1))
+                    else:
+                        t_next = t_scalar + dt
+                        tn = torch.full((B,), t_next, device=device)
+                        a = a1 * tn.unsqueeze(-1) + noise * (1.0 - tn.unsqueeze(-1))
+            else:
+                with torch.no_grad():
+                    v = model(a, t, condition)
+                a = a + v * dt
+
+        action_full[:, 2 * k : 2 * k + 2] = a
+
+    return action_full
 
 
 def rollout(
@@ -127,10 +141,7 @@ def rollout(
     n_ode_steps: int = 50,
     max_steps: int = 128,
     goal_threshold: float = 0.05,
-    snap_radius: float = 0.01,
     scene: ObstacleScene | None = None,
-    guidance_scale: float = 0.1,
-    obstacle_margin: float = 0.05,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     device = start.device
     B = start.shape[0]
@@ -140,43 +151,46 @@ def rollout(
     state = start.clone()
     trajectory = [state.clone()]
 
+    disk_reached = torch.zeros(B, n_disks, dtype=torch.bool, device=device)
     reached = torch.zeros(B, dtype=torch.bool, device=device)
 
-    for step in range(max_steps):
+    for _ in range(max_steps):
         if reached.all():
             break
 
-        goal_features = ActionStepDataset.compute_goal_features(state, goal, n_disks)
-        c = torch.cat([state, goal, goal_features], dim=-1)
-
         action = sample_action(
-            model, c,
-            n_ode_steps=n_ode_steps,
-            state=state,
-            scene=scene,
-            guidance_scale=guidance_scale,
-            obstacle_margin=obstacle_margin,
+            model, state, goal, n_disks=n_disks, n_ode_steps=n_ode_steps, scene=scene
         )
 
         if scene is not None and len(scene.obstacles) > 0:
             action = project_to_feasible(action, state, scene)
 
-        action = clamp_to_goal(action, state, goal, n_disks, snap_radius=snap_radius)
-
+        if disk_reached.any():
+            for k in range(n_disks):
+                s = 2 * k
+                e = s + 2
+                action[disk_reached[:, k], s:e] = 0.0
         action[reached] = 0.0
 
         next_pos = state[:, :pos_dim] + action
-        next_vel = action
+        # Within goal_threshold, snap position to exact goal (exact star alignment;
+        # avoids freezing short after marking reached with zero action).
+        for k in range(n_disks):
+            s, e = 2 * k, 2 * k + 2
+            gk = goal[:, s:e]
+            dk = (next_pos[:, s:e] - gk).norm(dim=-1)
+            snap_m = dk < goal_threshold
+            next_pos[snap_m, s:e] = gk[snap_m]
+        next_vel = next_pos - state[:, :pos_dim]
         state = torch.cat([next_pos, next_vel], dim=-1)
         trajectory.append(state.clone())
 
-        dists = []
         for k in range(n_disks):
             dx = state[:, 2 * k] - goal[:, 2 * k]
             dy = state[:, 2 * k + 1] - goal[:, 2 * k + 1]
-            dists.append((dx ** 2 + dy ** 2).sqrt())
-        max_dist = torch.stack(dists, dim=-1).max(dim=-1).values
-        reached = reached | (max_dist < goal_threshold)
+            dist_k = (dx ** 2 + dy ** 2).sqrt()
+            disk_reached[:, k] = disk_reached[:, k] | (dist_k < goal_threshold)
+        reached = reached | disk_reached.all(dim=1)
 
     trajectory = torch.stack(trajectory, dim=1)
     return trajectory, reached
@@ -240,22 +254,18 @@ def main():
     model = ActionVectorField(
         action_dim=ckpt["action_dim"],
         condition_dim=ckpt["condition_dim"],
-        time_embed_dim=ckpt["time_embed_dim"],
-        hidden_dims=tuple(ckpt["hidden_dims"]),
-        activation=ckpt.get("activation", "silu"),
     ).to(device)
     model.load_state_dict(ckpt["model"])
     model.eval()
 
     n_disks = ckpt["n_disks"]
 
-    # Build obstacle scene
     scene = None
     obstacles_cfg: list[dict] = []
     if cfg.obstacles_file:
         with open(cfg.obstacles_file) as f:
             obstacles_cfg = yaml.safe_load(f) or []
-    elif hasattr(cfg, "obstacles") and cfg.obstacles:
+    elif getattr(cfg, "obstacles", None):
         obstacles_cfg = cfg.obstacles
 
     if obstacles_cfg:
@@ -268,15 +278,16 @@ def main():
     if cfg.condition_from_data:
         data_root = Path(cfg.data_root) if cfg.data_root else (root / "data_trajectories")
         ds = ActionStepDataset(data_root, env_robot=cfg.env_robot)
-        state0, goal0, _, _ = ds[0]
+        state0, goal0, _, _, _ = ds[0]
         start = state0.unsqueeze(0).expand(cfg.num_samples, -1).to(device)
         goal = goal0.unsqueeze(0).expand(cfg.num_samples, -1).to(device)
         print("Using start/goal from first dataset sample.")
     else:
         state_dim = ckpt["state_dim"]
-        start = torch.rand(cfg.num_samples, state_dim, device=device) * 2 - 1
-        goal = torch.rand(cfg.num_samples, state_dim, device=device) * 2 - 1
-        print("Using random start/goal.")
+        start = torch.empty(cfg.num_samples, state_dim, device=device).uniform_(-1.0, 1.0)
+        goal = torch.empty(cfg.num_samples, state_dim, device=device).uniform_(-1.0, 1.0)
+        start.clamp_(-1.0, 1.0)
+        goal.clamp_(-1.0, 1.0)
 
     print(f"Rolling out {cfg.num_samples} trajectories (max {cfg.max_rollout_steps} steps)...")
 
@@ -288,10 +299,7 @@ def main():
         n_ode_steps=cfg.n_ode_steps,
         max_steps=cfg.max_rollout_steps,
         goal_threshold=cfg.goal_threshold,
-        snap_radius=cfg.snap_radius,
         scene=scene,
-        guidance_scale=cfg.guidance_scale,
-        obstacle_margin=cfg.obstacle_margin,
     )
 
     print(f"Trajectory shape: {trajectory.shape}")
@@ -306,6 +314,9 @@ def main():
         out_path = root / cfg.out
         torch.save(trajectory.cpu(), out_path)
         print(f"Saved to {out_path}")
+        goal_path = out_path.with_name(out_path.stem + "_goal.pt")
+        torch.save(goal.cpu(), goal_path)
+        print(f"Saved conditioned goal to {goal_path}")
 
 
 if __name__ == "__main__":

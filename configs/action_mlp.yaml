@@ -1,4 +1,5 @@
 model: action_mlp
+# Flow is 2D per disk; condition adds disk one-hot only.
 
 # training
 epochs: 100
@@ -8,12 +9,11 @@ sigma: 0.0
 save_dir: checkpoints_action
 log_every: 100
 
-# action MLP architecture
-hidden_dims: [512, 512, 512]
-time_embed_dim: 64
-activation: silu
-
 # rollout / sampling
 n_ode_steps: 50
 max_rollout_steps: 128
 goal_threshold: 0.05
+
+# obstacle avoidance (inference-time); with obstacles, ECI bridge mixing is always used (see sample_action.py).
+robot_radii: [0.08, 0.08]
+obstacles: []  # list of {center: [x, y], radius: r}

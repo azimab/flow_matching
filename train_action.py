@@ -19,9 +19,6 @@ DEFAULTS = dict(
     sigma=0.0,
     save_dir="checkpoints_action",
     log_every=100,
-    hidden_dims=[512, 512, 512],
-    time_embed_dim=64,
-    activation="silu",
     data_root=None,
     env_robot="EnvEmptyNoWait2D-RobotCompositeTwoPlanarDisk",
     device="cuda" if torch.cuda.is_available() else "cpu",
@@ -62,7 +59,7 @@ def main():
 
     ds = ActionStepDataset(data_root, env_robot=cfg.env_robot)
 
-    print(f"Dataset: {len(ds)} step-samples  |  "
+    print(f"Dataset: {len(ds)} per-disk step-samples  |  "
           f"state_dim={ds.state_dim}  action_dim={ds.action_dim}  "
           f"n_disks={ds.n_disks}  condition_dim={ds.condition_dim}")
 
@@ -77,9 +74,6 @@ def main():
     model = ActionVectorField(
         action_dim=ds.action_dim,
         condition_dim=ds.condition_dim,
-        time_embed_dim=cfg.time_embed_dim,
-        hidden_dims=tuple(cfg.hidden_dims),
-        activation=cfg.activation,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -98,11 +92,12 @@ def main():
         epoch_loss = 0.0
         n_batches = 0
 
-        for batch_state, batch_goal, batch_action, batch_gf in loader:
+        for batch_state, batch_goal, batch_action, batch_gf, batch_disk_oh in loader:
             batch_state = batch_state.to(device)
             batch_goal = batch_goal.to(device)
             batch_action = batch_action.to(device)
             batch_gf = batch_gf.to(device)
+            batch_disk_oh = batch_disk_oh.to(device)
 
             x1 = batch_action
             x0 = torch.randn_like(x1)
@@ -111,7 +106,10 @@ def main():
             xt = xt.to(device)
             ut = ut.to(device)
 
-            c = torch.cat([batch_state, batch_goal, batch_gf], dim=-1)
+            c = torch.cat(
+                [batch_state, batch_goal, batch_gf, batch_disk_oh],
+                dim=-1,
+            )
             v = model(xt, t, c)
 
             loss = (v - ut).pow(2).mean()
@@ -138,10 +136,8 @@ def main():
         "state_dim": ds.state_dim,
         "pos_dim": ds.pos_dim,
         "n_disks": ds.n_disks,
-        "hidden_dims": list(cfg.hidden_dims),
-        "time_embed_dim": cfg.time_embed_dim,
-        "activation": cfg.activation,
         "model_type": "action_mlp",
+        "per_disk_actions": True,
     }
     ckpt_path = save_dir / "action_checkpoint.pt"
     torch.save(ckpt, ckpt_path)

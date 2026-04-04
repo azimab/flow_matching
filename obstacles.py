@@ -41,36 +41,11 @@ class ObstacleScene:
         return ObstacleScene(obstacles=obs, robot_radii=robot_radii)
 
 
-def collision_cost(
-    action: torch.Tensor,
-    state: torch.Tensor,
-    scene: ObstacleScene,
-    margin: float = 0.05,
-) -> torch.Tensor:
-    """Differentiable collision cost using an exponential barrier on signed distance.
-
-    Returns a scalar cost (summed over batch, disks, and obstacles).
-    """
-    n_disks = scene.n_disks
-    pos_dim = n_disks * 2
-    next_pos = state[:, :pos_dim] + action
-
-    cost = torch.zeros(action.shape[0], device=action.device, dtype=action.dtype)
-    for k in range(n_disks):
-        disk_pos = next_pos[:, 2 * k : 2 * k + 2]
-        r_disk = scene.robot_radii[k]
-        for obs in scene.obstacles:
-            d = (disk_pos - obs.center).norm(dim=-1) - obs.radius - r_disk
-            cost = cost + torch.exp(-d / margin)
-    return cost.sum()
-
-
 def project_to_feasible(
     action: torch.Tensor,
     state: torch.Tensor,
     scene: ObstacleScene,
 ) -> torch.Tensor:
-    """Hard projection that resolves obstacle penetrations by pushing disks out."""
     n_disks = scene.n_disks
     pos_dim = n_disks * 2
     out = action.clone()
@@ -90,7 +65,6 @@ def project_to_feasible(
                 out[penetrating, 2 * k : 2 * k + 2] += correction
                 next_pos = state[:, :pos_dim] + out
 
-    # Inter-disk collision: push disks apart if they overlap
     for i in range(n_disks):
         for j in range(i + 1, n_disks):
             pi = next_pos[:, 2 * i : 2 * i + 2]
@@ -110,19 +84,30 @@ def project_to_feasible(
     return out
 
 
+def adjust_disk_action_slice(
+    a_slice: torch.Tensor,
+    action_full_prefix: torch.Tensor,
+    disk_k: int,
+    n_disks: int,
+    state: torch.Tensor,
+    scene: ObstacleScene,
+) -> torch.Tensor:
+    
+    B, two = a_slice.shape
+    assert two == 2
+    pos_dim = n_disks * 2
+    device, dtype = a_slice.device, a_slice.dtype
+    full = torch.zeros(B, pos_dim, device=device, dtype=dtype)
+    full[:, : 2 * disk_k] = action_full_prefix[:, : 2 * disk_k].to(dtype)
+    full[:, 2 * disk_k : 2 * disk_k + 2] = a_slice
+    full = project_to_feasible(full, state, scene)
+    return full[:, 2 * disk_k : 2 * disk_k + 2]
+
+
 def check_collisions(
     positions: torch.Tensor,
     scene: ObstacleScene,
 ) -> torch.Tensor:
-    """Check for collisions at given positions.
-
-    Args:
-        positions: (B, pos_dim) or (B, T, pos_dim) position tensor.
-        scene: obstacle scene with obstacles and robot radii.
-
-    Returns:
-        Boolean tensor of shape (B,) or (B, T) -- True where any collision occurs.
-    """
     squeezed = positions.dim() == 2
     if squeezed:
         positions = positions.unsqueeze(1)
@@ -151,16 +136,4 @@ def check_collisions(
     return colliding
 
 
-def create_example_scene(device: torch.device | None = None) -> ObstacleScene:
-    """A simple test scene with three circle obstacles and two robot disks."""
-    scene = ObstacleScene(
-        obstacles=[
-            CircleObstacle(center=torch.tensor([0.0, 0.3]), radius=0.15),
-            CircleObstacle(center=torch.tensor([-0.4, -0.2]), radius=0.1),
-            CircleObstacle(center=torch.tensor([0.3, -0.3]), radius=0.12),
-        ],
-        robot_radii=[0.08, 0.08],
-    )
-    if device is not None:
-        scene = scene.to(device)
-    return scene
+
